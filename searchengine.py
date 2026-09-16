@@ -1,14 +1,13 @@
 import re
-import sqlite3 as sqlite
 import urllib.request
 from urllib.parse import urljoin
-
+import nn
+import psycopg2 as pg
 from bs4 import BeautifulSoup
 
-import nn
+from db_config import DATABASE_CONFIG
 
 
-# Слова, которые не несут полезной информации для поиска
 IGNORE_WORDS = {
     "the",
     "of",
@@ -21,69 +20,67 @@ IGNORE_WORDS = {
 }
 
 
-class Crawler:
-    # Подключение к базе данных
-    def __init__(self, dbname):
-        self.con = sqlite.connect(dbname)
+def get_connection():
+    return pg.connect(**DATABASE_CONFIG)
 
-    # Закрытие подключения
+
+class Crawler:
+
+    def __init__(self, dbname=None):
+        self.con = get_connection()
+
     def __del__(self):
         if hasattr(self, "con"):
             self.con.close()
 
-    # Сохранение изменений в базе
     def dbcommit(self):
         self.con.commit()
 
-    # Получение идентификатора записи.
-    # Если записи нет, она создаётся.
     def getentryid(self, table, field, value):
-        result = self.con.execute(
-            f"""
-            SELECT rowid
-            FROM {table}
-            WHERE {field} = ?
-            """,
-            (value,)
-        ).fetchone()
+        with self.con.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id
+                FROM {table}
+                WHERE {field} = %s
+                """,
+                (value,)
+            )
 
-        if result is not None:
-            return result[0]
+            result = cur.fetchone()
 
-        cursor = self.con.execute(
-            f"""
-            INSERT INTO {table}({field})
-            VALUES (?)
-            """,
-            (value,)
-        )
+            if result is not None:
+                return result[0]
 
-        return cursor.lastrowid
+            cur.execute(
+                f"""
+                INSERT INTO {table}({field})
+                VALUES (%s)
+                RETURNING id
+                """,
+                (value,)
+            )
 
-    # Добавление страницы в поисковый индекс
+            return cur.fetchone()[0]
+
     def addtoindex(self, url, soup):
-        # Если страница уже проиндексирована,
-        # повторно её обрабатывать не нужно
+
         if self.isindexed(url):
             return
 
         print("Индексируется:", url)
 
-        # Получаем обычный текст страницы
         text = self.gettextonly(soup)
-
-        # Разбиваем текст на отдельные слова
         words = self.separatewords(text)
 
-        # Получаем идентификатор страницы
         urlid = self.getentryid(
             "urllist",
             "url",
             url
         )
 
-        # Добавляем все найденные слова в индекс
         for position, word in enumerate(words):
+
             if word in IGNORE_WORDS:
                 continue
 
@@ -93,18 +90,18 @@ class Crawler:
                 word
             )
 
-            # Запоминаем, где именно находится слово
-            self.con.execute(
-                """
-                INSERT INTO wordlocation
-                (urlid, wordid, location)
-                VALUES (?, ?, ?)
-                """,
-                (urlid, wordid, position)
-            )
+            with self.con.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO wordlocation
+                    (urlid, wordid, location)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (urlid, wordid, position)
+                )
 
-    # Получение текста из HTML без тегов
     def gettextonly(self, soup):
+
         text = soup.string
 
         if text is not None:
@@ -113,15 +110,16 @@ class Crawler:
         result = []
 
         for child in soup.contents:
-            result.append(
-                self.gettextonly(child)
-            )
+            child_text = self.gettextonly(child)
+
+            if child_text:
+                result.append(child_text)
 
         return "\n".join(result)
 
-    # Разбиение текста на отдельные слова
     def separatewords(self, text):
-        splitter = re.compile(r"\W+")
+
+        splitter = re.compile(r"\W+", re.UNICODE)
 
         return [
             word.lower()
@@ -129,35 +127,38 @@ class Crawler:
             if word
         ]
 
-    # Проверка, была ли страница уже проиндексирована
     def isindexed(self, url):
-        result = self.con.execute(
-            """
-            SELECT rowid
-            FROM urllist
-            WHERE url = ?
-            """,
-            (url,)
-        ).fetchone()
 
-        if result is None:
-            return False
+        with self.con.cursor() as cur:
 
-        # Если для URL уже есть хотя бы одно слово,
-        # значит страница была проиндексирована
-        word = self.con.execute(
-            """
-            SELECT rowid
-            FROM wordlocation
-            WHERE urlid = ?
-            """,
-            (result[0],)
-        ).fetchone()
+            cur.execute(
+                """
+                SELECT id
+                FROM urllist
+                WHERE url = %s
+                """,
+                (url,)
+            )
 
-        return word is not None
+            result = cur.fetchone()
 
-    # Сохранение информации о ссылке между страницами
+            if result is None:
+                return False
+
+            cur.execute(
+                """
+                SELECT id
+                FROM wordlocation
+                WHERE urlid = %s
+                LIMIT 1
+                """,
+                (result[0],)
+            )
+
+            return cur.fetchone() is not None
+
     def addlinkref(self, url_from, url_to, link_text):
+
         words = self.separatewords(link_text)
 
         from_id = self.getentryid(
@@ -172,46 +173,66 @@ class Crawler:
             url_to
         )
 
-        # Ссылка на саму себя не нужна
         if from_id == to_id:
             return
 
-        cursor = self.con.execute(
-            """
-            INSERT INTO link(fromid, toid)
-            VALUES (?, ?)
-            """,
-            (from_id, to_id)
-        )
+        with self.con.cursor() as cur:
 
-        link_id = cursor.lastrowid
-
-        # Сохраняем слова, использованные в тексте ссылки
-        for word in words:
-            if word in IGNORE_WORDS:
-                continue
-
-            word_id = self.getentryid(
-                "wordlist",
-                "word",
-                word
-            )
-
-            self.con.execute(
+            cur.execute(
                 """
-                INSERT INTO linkwords(wordid, linkid)
-                VALUES (?, ?)
+                SELECT id
+                FROM link
+                WHERE fromid = %s
+                  AND toid = %s
                 """,
-                (word_id, link_id)
+                (from_id, to_id)
             )
 
-    # Обход страниц сайта и создание поискового индекса
+            existing_link = cur.fetchone()
+
+            if existing_link is not None:
+                return
+
+            cur.execute(
+                """
+                INSERT INTO link(fromid, toid)
+                VALUES (%s, %s)
+                RETURNING id
+                """,
+                (from_id, to_id)
+            )
+
+            link_id = cur.fetchone()[0]
+
+            for word in words:
+
+                if word in IGNORE_WORDS:
+                    continue
+
+                word_id = self.getentryid(
+                    "wordlist",
+                    "word",
+                    word
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO linkwords(wordid, linkid)
+                    VALUES (%s, %s)
+                    """,
+                    (word_id, link_id)
+                )
+
     def crawl(self, pages, depth=2):
+
         for _ in range(depth):
+
             new_pages = set()
 
             for page in pages:
+
                 try:
+
                     request = urllib.request.Request(
                         page,
                         headers={
@@ -225,15 +246,16 @@ class Crawler:
                     )
 
                 except Exception as error:
+
                     print(
                         "Не могу открыть",
                         page,
                         ":",
                         error
                     )
+
                     continue
 
-                # Проверяем тип полученного содержимого
                 content_type = (
                     connection.headers.get_content_type()
                 )
@@ -243,16 +265,17 @@ class Crawler:
                     "application/xhtml+xml",
                     "text/plain"
                 }:
+
                     print(
                         "Пропускаю",
                         page,
                         ":",
                         content_type
                     )
+
                     connection.close()
                     continue
 
-                # Разбираем HTML-документ
                 soup = BeautifulSoup(
                     connection.read(),
                     "html.parser"
@@ -260,39 +283,32 @@ class Crawler:
 
                 connection.close()
 
-                # Добавляем страницу в индекс
                 self.addtoindex(
                     page,
                     soup
                 )
 
-                # Получаем все ссылки со страницы
                 for link in soup("a"):
+
                     if "href" not in link.attrs:
                         continue
 
-                    # Преобразуем относительную ссылку
-                    # в полный URL
                     url = urljoin(
                         page,
                         link["href"]
                     )
 
-                    # Не обрабатываем URL с кавычками
                     if "'" in url:
                         continue
 
-                    # Удаляем якорь после #
                     url = url.split("#")[0]
 
-                    # Добавляем только HTTP/HTTPS ссылки
                     if (
                         url.startswith("http")
                         and not self.isindexed(url)
                     ):
                         new_pages.add(url)
 
-                    # Сохраняем связь между страницами
                     link_text = self.gettextonly(link)
 
                     self.addlinkref(
@@ -305,174 +321,221 @@ class Crawler:
 
             pages = new_pages
 
-    # Создание таблиц поискового индекса
     def createindextables(self):
-        self.con.execute(
-            "CREATE TABLE urllist(url)"
-        )
 
-        self.con.execute(
-            "CREATE TABLE wordlist(word)"
-        )
+        with self.con.cursor() as cur:
 
-        self.con.execute(
-            """
-            CREATE TABLE wordlocation(
-                urlid,
-                wordid,
-                location
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS urllist(
+                    id SERIAL PRIMARY KEY,
+                    url TEXT UNIQUE NOT NULL
+                )
+                """
             )
-            """
-        )
 
-        self.con.execute(
-            """
-            CREATE TABLE link(
-                fromid INTEGER,
-                toid INTEGER
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wordlist(
+                    id SERIAL PRIMARY KEY,
+                    word TEXT UNIQUE NOT NULL
+                )
+                """
             )
-            """
-        )
 
-        self.con.execute(
-            """
-            CREATE TABLE linkwords(
-                wordid,
-                linkid
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS wordlocation(
+                    id SERIAL PRIMARY KEY,
+                    urlid INTEGER NOT NULL,
+                    wordid INTEGER NOT NULL,
+                    location INTEGER NOT NULL
+                )
+                """
             )
-            """
-        )
 
-        # Индексы ускоряют поиск по базе
-        self.con.execute(
-            "CREATE INDEX wordidx ON wordlist(word)"
-        )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS link(
+                    id SERIAL PRIMARY KEY,
+                    fromid INTEGER NOT NULL,
+                    toid INTEGER NOT NULL
+                )
+                """
+            )
 
-        self.con.execute(
-            "CREATE INDEX urlidx ON urllist(url)"
-        )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS linkwords(
+                    id SERIAL PRIMARY KEY,
+                    wordid INTEGER NOT NULL,
+                    linkid INTEGER NOT NULL
+                )
+                """
+            )
 
-        self.con.execute(
-            "CREATE INDEX wordurlidx "
-            "ON wordlocation(wordid)"
-        )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS wordidx
+                ON wordlist(word)
+                """
+            )
 
-        self.con.execute(
-            "CREATE INDEX urltoidx "
-            "ON link(toid)"
-        )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS urlidx
+                ON urllist(url)
+                """
+            )
 
-        self.con.execute(
-            "CREATE INDEX urlfromidx "
-            "ON link(fromid)"
-        )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS wordurlidx
+                ON wordlocation(wordid)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS urltoidx
+                ON link(toid)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS urlfromidx
+                ON link(fromid)
+                """
+            )
 
         self.dbcommit()
 
-    # Расчёт PageRank для всех страниц
     def calculatepagerank(self, iterations=20):
-        # Удаляем старые результаты
-        self.con.execute(
-            "DROP TABLE IF EXISTS pagerank"
-        )
 
-        # Создаём таблицу PageRank
-        self.con.execute(
-            """
-            CREATE TABLE pagerank(
-                urlid PRIMARY KEY,
-                score
+        with self.con.cursor() as cur:
+
+            cur.execute(
+                """
+                DROP TABLE IF EXISTS pagerank
+                """
             )
-            """
-        )
 
-        # Начальное значение PageRank для каждой страницы
-        self.con.execute(
-            """
-            INSERT INTO pagerank
-            SELECT rowid, 1.0
-            FROM urllist
-            """
-        )
+            cur.execute(
+                """
+                CREATE TABLE pagerank(
+                    urlid INTEGER PRIMARY KEY,
+                    score DOUBLE PRECISION
+                )
+                """
+            )
+
+            cur.execute(
+                """
+                INSERT INTO pagerank(urlid, score)
+                SELECT id, 1.0
+                FROM urllist
+                """
+            )
 
         self.dbcommit()
 
-        # Повторяем расчёт заданное количество раз
         for iteration in range(iterations):
+
             print(
                 "Итерация PageRank:",
                 iteration + 1
             )
 
-            for (url_id,) in self.con.execute(
-                "SELECT rowid FROM urllist"
-            ):
-                page_rank = 0.15
+            with self.con.cursor() as cur:
 
-                # Получаем страницы,
-                # которые ссылаются на текущую
-                for (linker,) in self.con.execute(
+                cur.execute(
                     """
-                    SELECT DISTINCT fromid
-                    FROM link
-                    WHERE toid = ?
-                    """,
-                    (url_id,)
-                ):
-                    # PageRank страницы-источника
-                    linking_rank = self.con.execute(
-                        """
-                        SELECT score
-                        FROM pagerank
-                        WHERE urlid = ?
-                        """,
-                        (linker,)
-                    ).fetchone()[0]
+                    SELECT id
+                    FROM urllist
+                    """
+                )
 
-                    # Количество ссылок
-                    # на странице-источнике
-                    linking_count = self.con.execute(
+                url_ids = [
+                    row[0]
+                    for row in cur.fetchall()
+                ]
+
+                for url_id in url_ids:
+
+                    page_rank = 0.15
+
+                    cur.execute(
                         """
-                        SELECT COUNT(*)
+                        SELECT DISTINCT fromid
                         FROM link
-                        WHERE fromid = ?
+                        WHERE toid = %s
                         """,
-                        (linker,)
-                    ).fetchone()[0]
+                        (url_id,)
+                    )
 
-                    if linking_count > 0:
-                        page_rank += (
-                            0.85 *
-                            linking_rank /
-                            linking_count
+                    linkers = cur.fetchall()
+
+                    for (linker,) in linkers:
+
+                        cur.execute(
+                            """
+                            SELECT score
+                            FROM pagerank
+                            WHERE urlid = %s
+                            """,
+                            (linker,)
                         )
 
-                # Записываем новый PageRank
-                self.con.execute(
-                    """
-                    UPDATE pagerank
-                    SET score = ?
-                    WHERE urlid = ?
-                    """,
-                    (page_rank, url_id)
-                )
+                        linking_rank = cur.fetchone()
+
+                        if linking_rank is None:
+                            continue
+
+                        linking_rank = linking_rank[0]
+
+                        cur.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM link
+                            WHERE fromid = %s
+                            """,
+                            (linker,)
+                        )
+
+                        linking_count = cur.fetchone()[0]
+
+                        if linking_count > 0:
+
+                            page_rank += (
+                                0.85
+                                * linking_rank
+                                / linking_count
+                            )
+
+                    cur.execute(
+                        """
+                        UPDATE pagerank
+                        SET score = %s
+                        WHERE urlid = %s
+                        """,
+                        (page_rank, url_id)
+                    )
 
             self.dbcommit()
 
 
 class Searcher:
-    # Подключение к базе поискового индекса
-    def __init__(self, dbname):
-        self.con = sqlite.connect(dbname)
 
-    # Закрытие подключения
+    def __init__(self, dbname=None):
+        self.con = get_connection()
+
     def __del__(self):
         if hasattr(self, "con"):
             self.con.close()
 
-    # Получение URL и позиций слов,
-    # соответствующих поисковому запросу
     def getmatchrows(self, query):
+
         words = query.split()
 
         if not words:
@@ -483,50 +546,60 @@ class Searcher:
         conditions = []
         fields = []
 
-        # Для каждого слова ищем его ID
-        for index, word in enumerate(words):
-            result = self.con.execute(
-                """
-                SELECT rowid
-                FROM wordlist
-                WHERE word = ?
-                """,
-                (word.lower(),)
-            ).fetchone()
+        with self.con.cursor() as cur:
 
-            if result is None:
-                continue
+            for index, word in enumerate(words):
 
-            word_id = result[0]
-            word_ids.append(word_id)
-
-            table_name = f"w{len(word_ids) - 1}"
-
-            tables.append(
-                f"wordlocation {table_name}"
-            )
-
-            fields.append(
-                f"{table_name}.urlid"
-                if len(word_ids) == 1
-                else f"{table_name}.location"
-            )
-
-            conditions.append(
-                f"{table_name}.wordid = {word_id}"
-            )
-
-            # Все слова запроса должны находиться
-            # на одной странице
-            if len(word_ids) > 1:
-                previous = (
-                    f"w{len(word_ids) - 2}"
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM wordlist
+                    WHERE word = %s
+                    """,
+                    (word.lower(),)
                 )
+
+                result = cur.fetchone()
+
+                if result is None:
+                    continue
+
+                word_id = result[0]
+
+                word_ids.append(word_id)
+
+                table_name = f"w{len(word_ids) - 1}"
+
+                tables.append(
+                    f"wordlocation {table_name}"
+                )
+
+                if len(word_ids) == 1:
+
+                    fields.append(
+                        f"{table_name}.urlid"
+                    )
+
+                else:
+
+                    fields.append(
+                        f"{table_name}.location"
+                    )
 
                 conditions.append(
-                    f"{previous}.urlid = "
-                    f"{table_name}.urlid"
+                    f"{table_name}.wordid = {word_id}"
                 )
+
+                if len(word_ids) > 1:
+
+                    previous = (
+                        f"w{len(word_ids) - 2}"
+                    )
+
+                    conditions.append(
+                        f"{previous}.urlid = "
+                        f"{table_name}.urlid"
+                    )
 
         if not word_ids:
             return [], []
@@ -537,21 +610,32 @@ class Searcher:
             f"WHERE {' AND '.join(conditions)}"
         )
 
-        rows = list(
-            self.con.execute(query_sql)
-        )
+        with self.con.cursor() as cur:
+
+            cur.execute(query_sql)
+
+            rows = list(
+                cur.fetchall()
+            )
 
         return rows, word_ids
 
-    # Нормализация значений в диапазон от 0 до 1
-    def normalizescores(self, scores, small_is_better=False):
+    def normalizescores(
+        self,
+        scores,
+        small_is_better=False
+    ):
+
         if not scores:
             return {}
 
         small_value = 0.00001
 
         if small_is_better:
-            min_score = min(scores.values())
+
+            min_score = min(
+                scores.values()
+            )
 
             return {
                 url: min_score /
@@ -559,7 +643,9 @@ class Searcher:
                 for url, score in scores.items()
             }
 
-        max_score = max(scores.values())
+        max_score = max(
+            scores.values()
+        )
 
         if max_score == 0:
             max_score = small_value
@@ -569,8 +655,8 @@ class Searcher:
             for url, score in scores.items()
         }
 
-    # Оценка по количеству совпадений слов
     def frequencyscore(self, rows):
+
         counts = {
             row[0]: 0
             for row in rows
@@ -579,17 +665,22 @@ class Searcher:
         for row in rows:
             counts[row[0]] += 1
 
-        return self.normalizescores(counts)
+        return self.normalizescores(
+            counts
+        )
 
-    # Оценка по расположению слов на странице
     def locationscore(self, rows):
+
         locations = {
             row[0]: 1000000
             for row in rows
         }
 
         for row in rows:
-            location = sum(row[1:])
+
+            location = sum(
+                row[1:]
+            )
 
             if location < locations[row[0]]:
                 locations[row[0]] = location
@@ -599,21 +690,26 @@ class Searcher:
             small_is_better=True
         )
 
-    # Оценка по PageRank
     def pagerankscore(self, rows):
+
         pageranks = {}
 
         for row in rows:
+
             url_id = row[0]
 
-            result = self.con.execute(
-                """
-                SELECT score
-                FROM pagerank
-                WHERE urlid = ?
-                """,
-                (url_id,)
-            ).fetchone()
+            with self.con.cursor() as cur:
+
+                cur.execute(
+                    """
+                    SELECT score
+                    FROM pagerank
+                    WHERE urlid = %s
+                    """,
+                    (url_id,)
+                )
+
+                result = cur.fetchone()
 
             if result is not None:
                 pageranks[url_id] = result[0]
@@ -622,15 +718,11 @@ class Searcher:
             pageranks
         )
 
-    # Получение общей оценки страниц
     def getscoredlist(self, rows):
+
         if not rows:
             return {}
 
-        # Используем три критерия:
-        # количество совпадений,
-        # расположение слов,
-        # PageRank
         scores = [
             self.frequencyscore(rows),
             self.locationscore(rows),
@@ -642,59 +734,74 @@ class Searcher:
             for row in rows
         }
 
-        # Складываем оценки по всем критериям
         for score_list in scores:
+
             for url_id in total_scores:
+
                 total_scores[url_id] += (
-                    score_list.get(url_id, 0.0)
+                    score_list.get(
+                        url_id,
+                        0.0
+                    )
                 )
 
         return total_scores
 
-    # Получение URL по его идентификатору
     def geturlname(self, url_id):
-        result = self.con.execute(
-            """
-            SELECT url
-            FROM urllist
-            WHERE rowid = ?
-            """,
-            (url_id,)
-        ).fetchone()
+
+        with self.con.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT url
+                FROM urllist
+                WHERE id = %s
+                """,
+                (url_id,)
+            )
+
+            result = cur.fetchone()
+
+        if result is None:
+            return None
 
         return result[0]
 
-    # Выполнение поискового запроса
     def query(self, query):
-        rows, word_ids = self.getmatchrows(query)
+
+        rows, word_ids = self.getmatchrows(
+            query
+        )
 
         if not rows:
-            print("По запросу ничего не найдено.")
+
+            print(
+                "По запросу ничего не найдено."
+            )
+
             return [], []
 
-        scores = self.getscoredlist(rows)
+        scores = self.getscoredlist(
+            rows
+        )
 
-        # Сортируем страницы
-        # от самой высокой оценки к самой низкой
         ranked = sorted(
             scores.items(),
             key=lambda item: item[1],
             reverse=True
         )
 
-        print("\nРезультаты поиска:")
+        print(
+            "\nРезультаты поиска:"
+        )
 
-        for score, url_id in [
-            (score, url_id)
-            for url_id, score in ranked[:10]
-        ]:
+        for url_id, score in ranked[:10]:
+
             print(
                 f"{score:.6f}\t"
                 f"{self.geturlname(url_id)}"
             )
 
-        # Возвращаем слова запроса
-        # и идентификаторы найденных страниц
         return (
             word_ids,
             [
@@ -703,16 +810,15 @@ class Searcher:
             ]
         )
 
-    # Получение оценки страниц от нейронной сети
     def nnscore(self, rows, word_ids):
-        # Получаем уникальные URL
+
         url_ids = list(
             dict.fromkeys(
-                row[0] for row in rows
+                row[0]
+                for row in rows
             )
         )
 
-        # Получаем оценки нейронной сети
         nn_results = nn.mynet.getresult(
             word_ids,
             url_ids
@@ -723,7 +829,6 @@ class Searcher:
             for i in range(len(url_ids))
         }
 
-        return self.normalizescores(scores)
-
-
-# Создание объекта поисковой системы
+        return self.normalizescores(
+            scores
+        )
